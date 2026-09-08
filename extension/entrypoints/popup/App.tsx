@@ -6,8 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { getDeviceLabel } from '@/lib/device';
 import type { SyncStatus } from '@/lib/types';
 import { EMPTY_STATUS } from '@/lib/types';
-
-import logoIcon from '@/assets/logo-icon.svg';
+import { SyntiveIcon } from '@/components/ui/SyntiveLogo';
 
 // Relative "last sync" label for the popup (popup UI copy is Indonesian-only).
 function formatTime(ts: number | null): string {
@@ -53,11 +52,7 @@ export default function App() {
   return (
     <div className="p-3">
       <div className="mb-3 flex items-center gap-2">
-        <img
-          src={logoIcon}
-          alt=""
-          className="h-7 w-7"
-        />
+        <SyntiveIcon className="h-7 w-7" />
         <div className="flex-1">
           <div className="text-sm font-semibold leading-tight">Syntive</div>
           <div className="text-[11px] tint-text">Bookmark sync</div>

@@ -11,7 +11,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import logo from '@/assets/logo.svg';
+import { SyntiveLogo } from '@/components/ui/SyntiveLogo';
 
 type Mode = 'choose' | 'create';
 
@@ -172,11 +172,7 @@ function OnboardingContent({ onDone }: { onDone: () => void }) {
         <div className="relative z-10 w-full max-w-105 rounded-3xl border border-white/20 bg-zinc-950/45 p-8 sm:p-9 shadow-[inset_0_1px_1px_rgba(255,255,255,0.25),0_20px_50px_rgba(0,0,0,0.8)] backdrop-blur-3xl flex flex-col items-center text-center space-y-6">
           {/* Original Light Logo */}
           <div className="py-1">
-            <img
-              src={logo}
-              alt="Syntive"
-              className="h-8 sm:h-9 select-none mx-auto drop-shadow-md"
-            />
+            <SyntiveLogo className="h-8 sm:h-9 mx-auto drop-shadow-md" />
           </div>
 
           {/* Secret Key Input */}

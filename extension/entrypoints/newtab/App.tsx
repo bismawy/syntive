@@ -2,7 +2,7 @@ import * as React from 'react';
 import { loadSession } from '@/lib/storage';
 import { Onboarding } from '@/components/onboarding/OnboardingView';
 import { Dashboard } from '@/components/layout/Dashboard';
-import logoIcon from '@/assets/logo-icon.svg';
+import { SyntiveIcon } from '@/components/ui/SyntiveLogo';
 
 import { initThemeListeners } from '@/lib/theme';
 
@@ -47,7 +47,7 @@ export default function App() {
   if (!ready) {
     return (
       <div className="flex h-screen items-center justify-center">
-        <img src={logoIcon} alt="Syntive" className="h-12 w-12 animate-pulse" />
+        <SyntiveIcon className="h-12 w-12 animate-pulse" />
       </div>
     );
   }

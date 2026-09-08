@@ -33,8 +33,7 @@ import { loadThemeConfig, saveThemeConfig, applyThemeConfig } from '@/lib/theme'
 import { LanguageProvider, useTranslation } from '@/lib/i18n';
 
 import { IconButton } from '@/components/ui/icon-button';
-import logo from '@/assets/logo.svg';
-import logoIcon from '@/assets/logo-icon.svg';
+import { SyntiveLogo, SyntiveIcon } from '@/components/ui/SyntiveLogo';
 
 interface SidebarNavItemProps {
   icon: React.ReactNode;
@@ -132,7 +131,7 @@ function SidebarHeader({
   return (
     <div className={cn('flex pt-1', collapsed ? 'flex-col items-center gap-3' : 'items-center justify-between px-1')}>
       {!collapsed && (
-        <img src={logo} alt="Syntive" className="h-6 w-auto select-none shrink-0" />
+        <SyntiveLogo className="h-6 w-auto" />
       )}
       <IconButton
         variant={collapsed ? 'outline' : 'ghost'}
@@ -141,7 +140,7 @@ function SidebarHeader({
         title={collapsed ? t('expandSidebar') : t('collapseSidebar')}
       >
         {collapsed ? (
-          <img src={logoIcon} alt="Syntive" className="h-5 w-5 shrink-0 select-none" />
+          <SyntiveIcon className="h-5 w-5" />
         ) : (
           <Sidebar2 className="h-4 w-4" />
         )}

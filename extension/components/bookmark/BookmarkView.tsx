@@ -25,7 +25,7 @@ import { FaviconImage } from '@/components/ui/FaviconImage';
 import { cn, domainOf } from '@/lib/utils';
 import { pointerThenCenter, DROP_ANIMATION } from '@/lib/dnd';
 import { useTranslation } from '@/lib/i18n';
-import logoIcon from '@/assets/logo-icon.svg';
+import { SyntiveIcon } from '@/components/ui/SyntiveLogo';
 
 /**
  * 2D Grid Collision Detection for Folder Cards:
@@ -233,7 +233,7 @@ export function BookmarkView() {
   if (loading) {
     return (
       <div className="flex h-full flex-1 items-center justify-center">
-        <img src={logoIcon} alt="" className="h-10 w-10 animate-pulse" />
+        <SyntiveIcon className="h-10 w-10 animate-pulse" />
       </div>
     );
   }

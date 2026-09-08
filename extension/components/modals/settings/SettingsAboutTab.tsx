@@ -5,7 +5,7 @@ import { Panel } from '@/components/ui/panel';
 import { MutedText } from '@/components/ui/muted-text';
 import { useTranslation } from '@/lib/i18n';
 import { checkHealth, getServerStats } from '@/lib/api';
-import logoIcon from '@/assets/logo-icon.svg';
+import { SyntiveIcon } from '@/components/ui/SyntiveLogo';
 
 export function SettingsAboutTab() {
   const { t } = useTranslation();
@@ -34,11 +34,7 @@ export function SettingsAboutTab() {
       {/* Header Branding with Logo */}
       <div className="flex items-center gap-3.5 pb-3">
         <div className="h-11 w-11 rounded-xl bg-background border border-border flex items-center justify-center shrink-0 p-2">
-          <img
-            src={logoIcon}
-            alt="Syntive Logo"
-            className="h-full w-full object-contain"
-          />
+          <SyntiveIcon className="h-full w-full" />
         </div>
         <div>
           <div className="flex items-center gap-2">
