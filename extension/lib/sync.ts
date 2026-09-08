@@ -1,0 +1,377 @@
+// Syntive sync engine — last-write-wins per device, with merge-on-pull.
+//
+// Model: the browser's bookmark *toolbar* subtree is serialized to a plain tree,
+// encrypted (AES-GCM) and pushed as a single blob. The server only stores the
+// latest version. On pull we MERGE the cloud tree with the local toolbar
+// (instead of wiping it): local bookmarks/folders not already in the cloud are
+// kept and pushed back, so a fresh install with pre-existing local bookmarks
+// does not lose them on first sync.
+//
+// Conflict policy: whichever device pushes last wins for the items it carries;
+// unpushed local edits on a device that then pulls are merged into the cloud
+// tree rather than dropped. Tracked via a "dirty" flag set by bookmark change
+// listeners. Single blob per account, not per-item merge. Upgrade to granular
+// merge if multi-user concurrent editing is ever needed.
+
+import { encryptJSON, decryptJSON } from './crypto';
+import { getVault, putVault, upsertDevice, ConflictError, UnauthorizedError } from './api';
+import { getDeviceId, getDeviceLabel } from './device';
+import { loadSession, clearSession, getVersion, setVersion, setLastSync, KEYS } from './storage';
+import { getTrashItems, saveTrashItems, type TrashItem } from './trash';
+import type { SyncStatus } from './types';
+import { EMPTY_STATUS } from './types';
+
+// Track last-written device label to avoid redundant D1 writes.
+// Device label only changes on OS/browser upgrade — not every sync.
+const LAST_LABEL_KEY = 'syntive.lastDeviceLabel';
+
+export interface TreeNode {
+  title: string;
+  url?: string;       // present => leaf bookmark; absent => folder
+  children?: TreeNode[];
+}
+
+const DIRTY_KEY = 'syntive.dirty';
+
+async function isDirty(): Promise<boolean> {
+  const data = await browser.storage.local.get(DIRTY_KEY);
+  return data[DIRTY_KEY] === true;
+}
+export async function setDirty(v: boolean): Promise<void> {
+  await browser.storage.local.set({ [DIRTY_KEY]: v });
+}
+
+// Suppress bookmark events fired by our own programmatic restore.
+let suppress = false;
+export function isSuppressed(): boolean { return suppress; }
+
+function toolbarId(): string {
+  // Chrome/Edge: "1". Firefox: "toolbar_____". WXT exposes BROWSER at build time.
+  const b = (import.meta as any).env?.BROWSER ?? 'chrome';
+  return b === 'firefox' ? 'toolbar_____' : '1';
+}
+export { toolbarId };
+
+export async function serializeNode(node: Browser.bookmarks.BookmarkTreeNode): Promise<TreeNode> {
+  const out: TreeNode = node.url
+    ? { title: node.title ?? '', url: node.url }
+    : { title: node.title ?? '', children: [] };
+  if (!node.url) {
+    const kids = node.children ?? (await browser.bookmarks.getChildren(node.id));
+    out.children = [];
+    for (const k of kids) out.children.push(await serializeNode(k));
+  }
+  return out;
+}
+
+async function serializeToolbar(): Promise<TreeNode> {
+  const id = toolbarId();
+  const nodes = await browser.bookmarks.getSubTree(id);
+  const root = nodes[0];
+  return serializeNode(root);
+}
+
+async function clearToolbar(): Promise<void> {
+  const id = toolbarId();
+  const children = await browser.bookmarks.getChildren(id);
+  for (const c of children) {
+    try {
+      await browser.bookmarks.removeTree(c.id);
+    } catch {
+      await browser.bookmarks.remove(c.id).catch(() => {});
+    }
+  }
+}
+
+export async function restoreTree(parentId: string, nodes: TreeNode[]): Promise<void> {
+  for (const node of nodes) {
+    const created = await browser.bookmarks.create({
+      parentId,
+      title: node.title,
+      ...(node.url ? { url: node.url } : {}),
+    });
+    if (!node.url && node.children?.length) {
+      await restoreTree(created.id, node.children);
+    }
+  }
+}
+
+function countBookmarks(node: TreeNode): number {
+  if (node.url) return 1;
+  return (node.children ?? []).reduce((n, c) => n + countBookmarks(c), 0);
+}
+
+export function canonicalUrl(raw?: string | null): string {
+  if (!raw) return '';
+  try {
+    const u = new URL(raw.trim());
+    const protocol = u.protocol.toLowerCase();
+    const hostname = u.hostname.toLowerCase().replace(/^www\./, '');
+    let pathname = u.pathname;
+    if (pathname.length > 1 && pathname.endsWith('/')) {
+      pathname = pathname.slice(0, -1);
+    } else if (pathname === '/') {
+      pathname = '';
+    }
+    u.searchParams.sort();
+    const search = u.searchParams.toString();
+    return `${protocol}//${hostname}${pathname}${search ? '?' + search : ''}${u.hash || ''}`;
+  } catch {
+    return raw.trim().toLowerCase().replace(/\/+$/, '');
+  }
+}
+
+export function collectAllUrls(nodes: TreeNode[], set = new Set<string>()): Set<string> {
+  for (const n of nodes) {
+    if (n.url) set.add(canonicalUrl(n.url));
+    if (n.children) collectAllUrls(n.children, set);
+  }
+  return set;
+}
+
+// Merge `additions` into `base` without duplicates.
+// Bookmarks dedup by canonical URL; folders dedup by trimmed title (case-insensitive) and merge children recursively.
+// globalUrls: canonical URLs already present across the cloud tree (prevents cross-folder duplicates on initial sync).
+export function mergeChildren(base: TreeNode[], additions: TreeNode[], globalUrls?: Set<string>): TreeNode[] {
+  const result: TreeNode[] = base.map((n) => ({
+    ...n,
+    children: n.children ? n.children.map((c) => ({ ...c })) : undefined,
+  }));
+
+  const localCanonicalUrls = new Set<string>();
+  for (const item of result) {
+    if (item.url) localCanonicalUrls.add(canonicalUrl(item.url));
+  }
+
+  for (const add of additions) {
+    if (add.url) {
+      const cUrl = canonicalUrl(add.url);
+      if (localCanonicalUrls.has(cUrl) || (globalUrls && globalUrls.has(cUrl))) {
+        // Skip duplicate. If existing item has no/generic title and addition has a better one, adopt it.
+        const existingItem = result.find((n) => n.url && canonicalUrl(n.url) === cUrl);
+        if (existingItem && (!existingItem.title || existingItem.title === existingItem.url) && add.title) {
+          existingItem.title = add.title;
+        }
+        continue;
+      }
+      localCanonicalUrls.add(cUrl);
+      if (globalUrls) globalUrls.add(cUrl);
+      result.push({ ...add });
+    } else {
+      const normTitle = (add.title || '').trim().toLowerCase();
+      const existing = result.find((n) => !n.url && (n.title || '').trim().toLowerCase() === normTitle);
+      if (existing) {
+        existing.children = mergeChildren(existing.children ?? [], add.children ?? [], globalUrls);
+      } else {
+        result.push({
+          ...add,
+          children: add.children ? mergeChildren([], add.children, globalUrls) : [],
+        });
+      }
+    }
+  }
+  return result;
+}
+
+async function countLocalBookmarks(): Promise<number> {
+  try {
+    const tree = await serializeToolbar();
+    return countBookmarks(tree);
+  } catch {
+    return 0;
+  }
+}
+
+// Free-tier quota: 1 MB of plaintext bookmark data per account.
+// Server can't measure plaintext (blobs are encrypted), so this is enforced
+// client-side for UX; the backend only enforces a hard blob-size safety cap.
+export const QUOTA_PLAINTEXT_BYTES = 1_000_000;
+
+// Current plaintext size of the vault (what would be pushed on next sync).
+export async function measurePlaintextBytes(): Promise<number> {
+  const tree = await serializeToolbar();
+  const trash = await getTrashItems();
+  return new TextEncoder().encode(JSON.stringify({ tree, trash })).length;
+}
+
+// Guard against concurrent syncNow() calls (alarm + popup click firing together).
+let syncing = false;
+
+export async function syncNow(): Promise<SyncStatus> {
+  if (syncing) return getStatus();
+  const session = await loadSession();
+  if (!session) return { ...EMPTY_STATUS, error: 'not-onboarded' };
+
+  syncing = true;
+  try {
+    const authId = session.authId;
+    const localKnown = await getVersion();
+    
+    // On first sync/onboarding, proactively register this device before checking vault
+    // to ensure the D1 backend knows it exists and doesn't block it with a 401.
+    if (localKnown === 0) {
+      const label = getDeviceLabel();
+      await upsertDevice(authId, await getDeviceId(), label);
+      await browser.storage.local.set({ [LAST_LABEL_KEY]: label });
+    }
+
+    const server = await getVault(authId);
+    const dirty = await isDirty();
+
+    let tree = await serializeToolbar();
+    let trashItems = await getTrashItems();
+
+    if (server.version > localKnown) {
+      // Server is newer → pull vault.
+      // Merge local bookmarks ONLY on initial sync (localKnown === 0) or if local has unpushed edits (dirty).
+      // On clean pull, the cloud tree is authoritative — prevents resurrection and duplication of deleted/moved items.
+      if (server.blob) {
+        const doc = await decryptJSON<{ tree: TreeNode; trash?: TrashItem[] }>(server.blob, session.encKey);
+        const cloudChildren = doc.tree.children ?? [];
+        const localChildren = tree.children ?? [];
+
+        const shouldMerge = localKnown === 0 || dirty;
+        const globalUrls = shouldMerge ? collectAllUrls(cloudChildren) : undefined;
+        const mergedChildren = shouldMerge
+          ? mergeChildren(cloudChildren, localChildren, globalUrls)
+          : cloudChildren;
+
+        const cloudCount = cloudChildren.reduce((n, c) => n + countBookmarks(c), 0);
+        const mergedCount = mergedChildren.reduce((n, c) => n + countBookmarks(c), 0);
+        const localAddedSomething = shouldMerge && mergedCount > cloudCount;
+
+        // Merge or update trash items
+        if (doc.trash !== undefined) {
+          const remoteTrashMap = new Map(doc.trash.map((t) => [t.id, t]));
+          const lastSyncTime = ((await browser.storage.local.get(KEYS.lastSync))[KEYS.lastSync] as number) ?? 0;
+          for (const localT of trashItems) {
+            // Keep local items only if moved to trash locally after last sync
+            if (!remoteTrashMap.has(localT.id) && localT.deletedAt > lastSyncTime) {
+              remoteTrashMap.set(localT.id, localT);
+            }
+          }
+          const mergedTrash = Array.from(remoteTrashMap.values());
+          await saveTrashItems(mergedTrash);
+          trashItems = mergedTrash;
+        }
+
+        // Apply merged tree to local toolbar. Restore top-level nodes
+        // independently so one bad node (e.g. an invalid URL) doesn't abort
+        // the rest — local-only nodes after it would otherwise be lost.
+        suppress = true;
+        let restoreFailures = 0;
+        try {
+          await clearToolbar();
+          for (const child of mergedChildren) {
+            try {
+              await restoreTree(toolbarId(), [child]);
+            } catch (err) {
+              restoreFailures++;
+              console.warn('syntive: failed to restore node', child.title, err);
+            }
+          }
+        } finally {
+          // Allow pending async onCreated/onRemoved events from the restore to drain
+          setTimeout(() => {
+            suppress = false;
+          }, 500);
+        }
+        if (restoreFailures > 0) {
+          // Partial restore: the local tree is incomplete, so never push it
+          // (that would drop the unrestored cloud items from the vault) and
+          // don't advance the known version — the next sync re-pulls and
+          // re-merges instead.
+          return { ...EMPTY_STATUS, error: `restore-failed (${restoreFailures} nodes)` };
+        }
+        tree = await serializeToolbar();
+
+        let pushConflict = false;
+        if (localAddedSomething) {
+          // Local contributed new items → push merged tree back to cloud so
+          // other devices receive them too. Optimistic lock on server.version.
+          try {
+            const blob = await encryptJSON({ tree, trash: trashItems }, session.encKey);
+            const res = await putVault(authId, blob, server.version);
+            await setVersion(res.version);
+          } catch (err) {
+            if (err instanceof ConflictError) {
+              // Another device pushed first. Keep dirty=true so the next sync
+              // re-merges against the new server version instead of dropping
+              // the local items we just restored.
+              pushConflict = true;
+              await setVersion(server.version);
+            } else {
+              throw err;
+            }
+          }
+        } else {
+          await setVersion(server.version);
+        }
+        // Only clear dirty when the merge+push fully succeeded. On conflict,
+        // leave dirty=true so the next sync re-merges local items.
+        if (!pushConflict) await setDirty(false);
+      } else {
+        await setVersion(server.version);
+        await setDirty(false);
+      }
+    } else if (dirty || server.version === 0) {
+      // Local has changes (or first ever push) → push with optimistic lock.
+      // Server controls version increment; we send what we read as expectedVersion.
+      try {
+        const blob = await encryptJSON({ tree, trash: trashItems }, session.encKey);
+        const res = await putVault(authId, blob, server.version);
+        await setVersion(res.version);
+        await setDirty(false);
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          // Another device pushed first. Leave dirty=true and don't update
+          // version — next sync will see server is ahead and pull (LWW).
+          // Local unpushed changes will be overwritten by the pull. This is
+          // the approved last-write-wins behavior.
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    const now = Date.now();
+    await setLastSync(now);
+
+    // Register device only on first sync or when label changes (rare).
+    // Saves ~95% of device-table writes vs writing on every sync.
+    const label = getDeviceLabel();
+    const stored = await browser.storage.local.get(LAST_LABEL_KEY);
+    if (server.version === 0 || stored[LAST_LABEL_KEY] !== label) {
+      await upsertDevice(authId, await getDeviceId(), label);
+      await browser.storage.local.set({ [LAST_LABEL_KEY]: label });
+    }
+
+    return {
+      lastSync: now,
+      totalBookmarks: countBookmarks(tree),
+      syncing: false,
+      error: null,
+      version: await getVersion(),
+    };
+  } catch (err) {
+    if (err instanceof UnauthorizedError) {
+      await clearSession();
+    }
+    return { ...EMPTY_STATUS, error: String(err) };
+  } finally {
+    syncing = false;
+  }
+}
+
+export async function getStatus(): Promise<SyncStatus> {
+  const session = await loadSession();
+  if (!session) return { ...EMPTY_STATUS };
+  const data = await browser.storage.local.get([KEYS.lastSync, KEYS.version]);
+  return {
+    lastSync: (data[KEYS.lastSync] as number) ?? null,
+    totalBookmarks: await countLocalBookmarks(),
+    syncing: false,
+    error: null,
+    version: (data[KEYS.version] as number) ?? 0,
+  };
+}
